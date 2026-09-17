@@ -9,12 +9,13 @@ use std::{
   ptr::NonNull,
 };
 
+use dispatch2::{DispatchQueue, MainThreadBound};
 use http::{
   Request, Response as HttpResponse, StatusCode, Version,
   header::{CONTENT_LENGTH, CONTENT_TYPE},
 };
 use objc2::{
-  AllocAnyThread, ClassType, Message,
+  AllocAnyThread, ClassType, MainThreadMarker, Message,
   rc::Retained,
   runtime::{AnyClass, AnyObject, ClassBuilder, ProtocolObject},
 };
@@ -25,6 +26,38 @@ use objc2_foundation::{
 use objc2_web_kit::{WKURLSchemeHandler, WKURLSchemeTask};
 
 use crate::{RequestAsyncResponder, WryWebView, wkwebview::WEBVIEW_STATE};
+
+/// Keeps main-thread-only values safe to send without synchronously blocking
+/// the dropping thread when the value is abandoned there.
+struct AsyncMainThreadBound<T: 'static>(Option<MainThreadBound<T>>);
+
+impl<T: 'static> AsyncMainThreadBound<T> {
+  fn new(inner: T, mtm: MainThreadMarker) -> Self {
+    Self(Some(MainThreadBound::new(inner, mtm)))
+  }
+
+  fn into_inner(mut self, mtm: MainThreadMarker) -> T {
+    self.0.take().unwrap().into_inner(mtm)
+  }
+}
+
+impl<T: 'static> Drop for AsyncMainThreadBound<T> {
+  fn drop(&mut self) {
+    let Some(inner) = self.0.take() else {
+      return;
+    };
+
+    if let Some(mtm) = MainThreadMarker::new() {
+      drop(inner.into_inner(mtm));
+    } else {
+      DispatchQueue::main().exec_async(move || {
+        // SAFETY: this closure is executing on the main dispatch queue.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        drop(inner.into_inner(mtm));
+      });
+    }
+  }
+}
 
 pub fn create(name: &str) -> &AnyClass {
   unsafe {
@@ -72,7 +105,7 @@ extern "C" fn start_task(
   let task_guard = TaskKeyGuard {
     webview: webview.retain(),
     task_key,
-    task_uuid: task_uuid.clone(),
+    task_uuid,
   };
 
   let ivar = this.class().instance_variable(c"webview_id").unwrap();
@@ -194,26 +227,20 @@ extern "C" fn start_task(
     // send response
     match http_request.body(sent_form_body) {
       Ok(final_request) => {
-        let task = task.retain();
+        let Some(mtm) = MainThreadMarker::new() else {
+          #[cfg(feature = "tracing")]
+          tracing::error!("WKURLSchemeHandler callback did not run on the main thread");
+          // The task key is removed by `TaskKeyGuard`.
+          return;
+        };
+        // These WebKit objects originate on the main thread and must only be
+        // accessed there, even when the responder is sent to a worker thread.
+        // `TaskKeyGuard` is kept with them so the task key is also removed on
+        // the main thread, including when the responder is never called.
+        let response_context = AsyncMainThreadBound::new((task.retain(), task_guard, url), mtm);
         let responder_webview_id = webview_id.clone();
         let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> =
           Box::new(move |sent_response| {
-            let webview_id = responder_webview_id.as_str();
-            let webview = &*task_guard.webview;
-            // Consolidate checks before calling into `did*` methods.
-            let validate = || -> crate::Result<()> {
-              check_webview_id_valid(webview_id)?;
-              check_task_is_valid(webview, task_key, task_uuid.clone())?;
-              Ok(())
-            };
-
-            // Perform an upfront validation
-            if let Err(_e) = validate() {
-              #[cfg(feature = "tracing")]
-              tracing::warn!("Task invalid before sending response: {:?}", _e);
-              return; // If invalid, return early without calling task methods.
-            }
-
             fn response(
               // FIXME: though we give it a static lifetime, it's not guaranteed to be valid.
               task: Retained<ProtocolObject<dyn WKURLSchemeTask>>,
@@ -304,20 +331,36 @@ extern "C" fn start_task(
               check_webview_id_valid(webview_id)
             }
 
-            #[cfg(feature = "tracing")]
-            let _span = tracing::info_span!("wry::custom_protocol::call_handler").entered();
+            let deliver_response = move |mtm| {
+              let (task, task_guard, url) = response_context.into_inner(mtm);
 
-            if let Err(_e) = response(
-              task,
-              webview,
-              task_key,
-              task_uuid,
-              webview_id,
-              url,
-              sent_response,
-            ) {
               #[cfg(feature = "tracing")]
-              tracing::error!("Error responding to task: {:?}", _e);
+              let _span = tracing::info_span!("wry::custom_protocol::call_handler").entered();
+
+              if let Err(_e) = response(
+                task,
+                &task_guard.webview,
+                task_key,
+                task_guard.task_uuid.clone(),
+                &responder_webview_id,
+                url,
+                sent_response,
+              ) {
+                #[cfg(feature = "tracing")]
+                tracing::error!("Error responding to task: {:?}", _e);
+              }
+            };
+
+            if let Some(mtm) = MainThreadMarker::new() {
+              deliver_response(mtm);
+            } else {
+              // Queue validation and the complete response sequence as one
+              // unit so stopURLSchemeTask cannot interleave with the did* calls.
+              DispatchQueue::main().exec_async(move || {
+                // SAFETY: this closure is executing on the main dispatch queue.
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                deliver_response(mtm);
+              });
             }
           });
 
