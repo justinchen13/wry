@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.58.2]
+
+- [`69dfb2a`](https://github.com/tauri-apps/wry/commit/69dfb2ac9d56fac699bbfdbfcfb8cee2d728381b) ([#1962](https://github.com/tauri-apps/wry/pull/1962) by [@lucasfernog](https://github.com/tauri-apps/wry/../../lucasfernog)) On Linux, fix a window opened by allowing a new window request losing its webview when the same webview opened or closed another one.
+- [`d503291`](https://github.com/tauri-apps/wry/commit/d503291b2216b34b9c148dbaa441b8c661e4b199) ([#1960](https://github.com/tauri-apps/wry/pull/1960) by [@Tunglies](https://github.com/tauri-apps/wry/../../Tunglies)) Fixed macOS/iOS memory leaks of custom URL scheme handlers and their `webview_id` strings, of the IPC handler on a `WKUserContentController` shared between webviews, of proxy configuration objects and of custom protocol task entries.
+
 ## [0.58.1]
 
 ### feat
